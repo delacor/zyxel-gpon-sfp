@@ -96,18 +96,25 @@ def scrape_temperatures(
     buf = bytearray()
 
     try:
-        # Zyxel CLI login (after SSH auth)
-        if _read_until(chan, [b"Login:", b"login:"], io_timeout, buf) is None:
-            return None, None, "timeout waiting for CLI Login:"
-        chan.send(cli_user.encode("ascii") + b"\n")
+        # Zyxel CLI login (after SSH auth). Some firmware sessions are already
+        # authenticated and show a prompt directly.
+        cli_prompts = [b"ZYXEL#", b"Hal#", b"T&W#"]
+        first_marker = _read_until(chan, [b"Login:", b"login:", *cli_prompts], io_timeout, buf)
+        if first_marker is None:
+            return None, None, "timeout waiting for CLI Login: or prompt"
 
-        if _read_until(chan, [b"Password:", b"password:"], io_timeout, buf) is None:
-            return None, None, "timeout waiting for CLI Password:"
-        chan.send(cli_password.encode("ascii") + b"\n")
+        if first_marker in (b"Login:", b"login:"):
+            chan.send(cli_user.encode("ascii") + b"\n")
+            if _read_until(chan, [b"Password:", b"password:"], io_timeout, buf) is None:
+                return None, None, "timeout waiting for CLI Password:"
+            chan.send(cli_password.encode("ascii") + b"\n")
+            if _read_until(chan, cli_prompts, io_timeout, buf) is None:
+                snippet = bytes(buf)[-400:].decode("utf-8", errors="replace")
+                return None, None, f"timeout waiting for CLI prompt (ZYXEL#/Hal#/T&W#); tail={snippet!r}"
 
-        if _read_until(chan, [b"ZYXEL#", b"Hal#"], io_timeout, buf) is None:
+        if _read_until(chan, cli_prompts, io_timeout, buf) is None:
             snippet = bytes(buf)[-400:].decode("utf-8", errors="replace")
-            return None, None, f"timeout waiting for ZYXEL#/Hal#; tail={snippet!r}"
+            return None, None, f"timeout waiting for CLI prompt (ZYXEL#/Hal#/T&W#); tail={snippet!r}"
 
         # If stuck in HAL menu, exit to ZYXEL#
         if b"Hal#" in _strip_ansi(bytes(buf)):
@@ -257,7 +264,11 @@ def main() -> None:
             self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                # Scraper disconnected before reading the full response.
+                pass
 
     httpd = HTTPServer((bind_host, bind_port), Handler)
     print(
