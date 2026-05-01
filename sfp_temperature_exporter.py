@@ -63,19 +63,30 @@ def _read_until(
 
 def _graceful_logout(chan: paramiko.Channel) -> None:
     """
-    Best-effort: send `exit` at each nested CLI layer so the device tears down
-    its session promptly. Some firmware only allows a small number of
-    concurrent CLI sessions; orphaned sessions accumulate over time and cause
-    later scrapes to fail with `timeout waiting for CLI Login:`.
+    Best-effort: walk back through nested CLI layers and actually disconnect.
+
+    On this firmware:
+      - `exit` is the BusyBox-level command to leave `linuxshell` and drop
+        back to the Zyxel CLI prompt (ZYXEL#/T&W#/Hal#).
+      - At the Zyxel CLI prompt, `exit` is effectively a no-op; only `quit`
+        ends the session ("Connection closed by foreign host").
+
+    Sending `exit` then `quit` covers both cases: from linuxshell it goes
+    linuxshell -> CLI -> disconnect; from the CLI itself the leading `exit`
+    is harmless and `quit` closes the session.
+
+    Sessions left open here accumulate on the device because it only allows
+    a small number of concurrent CLI sessions, eventually causing scrapes
+    to fail with `timeout waiting for CLI Login:`.
     """
-    for _ in range(3):
+    for cmd in (b"exit\n", b"quit\n"):
         try:
             if chan.closed:
                 return
-            chan.send(b"exit\n")
+            chan.send(cmd)
         except Exception:
             return
-        time.sleep(0.15)
+        time.sleep(0.2)
         try:
             while chan.recv_ready():
                 chan.recv(65536)
