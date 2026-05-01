@@ -61,6 +61,33 @@ def _read_until(
     return None
 
 
+def _graceful_logout(chan: paramiko.Channel) -> None:
+    """
+    Best-effort: send `exit` at each nested CLI layer so the device tears down
+    its session promptly. Some firmware only allows a small number of
+    concurrent CLI sessions; orphaned sessions accumulate over time and cause
+    later scrapes to fail with `timeout waiting for CLI Login:`.
+    """
+    for _ in range(3):
+        try:
+            if chan.closed:
+                return
+            chan.send(b"exit\n")
+        except Exception:
+            return
+        time.sleep(0.15)
+        try:
+            while chan.recv_ready():
+                chan.recv(65536)
+        except Exception:
+            return
+        try:
+            if chan.exit_status_ready() or chan.closed:
+                return
+        except Exception:
+            return
+
+
 def scrape_temperatures(
     host: str,
     port: int,
@@ -166,11 +193,25 @@ def scrape_temperatures(
             return None, None, f"parse failed for line: {data_line!r}"
         return soc, optic, None
     finally:
+        _graceful_logout(chan)
+        try:
+            chan.shutdown(2)
+        except Exception:
+            pass
         try:
             chan.close()
         except Exception:
             pass
-        client.close()
+        try:
+            transport = client.get_transport()
+            if transport is not None:
+                transport.close()
+        except Exception:
+            pass
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 _lock = threading.Lock()
