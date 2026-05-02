@@ -2,13 +2,16 @@
 """
 Prometheus text exporter for Zyxel GPON SFP optic stats via HTTP.
 
-Uses GET /cgi/get_gpon_info (same as zyxel_gpon_sfp.py / the Web UI). Parses
-labeled lines such as "Temperature: 42.85C" from HTML or text; if those are
-missing, tries demjson on a JavaScript object response (firmware quirk).
+Uses GET /cgi/get_gpon_info (same as zyxel_gpon_sfp.py / the Web UI).
+
+The gpon_info.html UI uses evalJSON() on the response and keys temp, voltage,
+current, tx_power, rx_power (see getGponInfoResult in firmware). We parse those
+first, then fall back to labeled HTML regex and a loose dict walk.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import re
@@ -40,74 +43,60 @@ def _parse_float_unit(
         return None
 
 
-def parse_gpon_info_body(body: str) -> Dict[str, Optional[float]]:
-    """
-    Extract optic metrics from raw HTTP body (HTML page fragment, JS object, etc.).
-    Returns keys: temperature_c, voltage_v, current_ma, tx_power_dbm, rx_power_dbm.
-    """
-    out: Dict[str, Optional[float]] = {
-        "temperature_c": None,
-        "voltage_v": None,
-        "current_ma": None,
-        "tx_power_dbm": None,
-        "rx_power_dbm": None,
-    }
-
-    t = _parse_float_unit(
-        body,
-        re.compile(r"Temperature\s*:\s*([\d.]+)\s*C", re.I),
-        float,
-    )
-    if t is not None:
-        out["temperature_c"] = t
-
-    v = _parse_float_unit(
-        body,
-        re.compile(r"Voltage\s*:\s*([\d.]+)\s*V", re.I),
-        float,
-    )
-    if v is not None:
-        out["voltage_v"] = v
-
-    c = _parse_float_unit(
-        body,
-        re.compile(r"Current\s*:\s*([\d.]+)\s*mA", re.I),
-        float,
-    )
-    if c is not None:
-        out["current_ma"] = c
-
-    tx = _parse_float_unit(
-        body,
-        re.compile(r"TX\s*Power\s*:\s*([-+]?[\d.]+)\s*dBm", re.I),
-        float,
-    )
-    if tx is not None:
-        out["tx_power_dbm"] = tx
-
-    rx = _parse_float_unit(
-        body,
-        re.compile(r"Rx\s*Power\s*:?\s*([-+]?[\d.]+)\s*dBm", re.I),
-        float,
-    )
-    if rx is not None:
-        out["rx_power_dbm"] = rx
-
-    if out["temperature_c"] is None and demjson is not None:
-        _fill_from_demjson(body, out)
-
-    return out
+def _coerce_float(val: Any) -> Optional[float]:
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        m = re.match(r"^([-+]?[\d.]+)", val.strip())
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
+    return None
 
 
-def _fill_from_demjson(body: str, out: Dict[str, Optional[float]]) -> None:
+# Keys from gpon_info.html getGponInfoResult() — raw CGI values before UI adds units.
+_FIRMWARE_GPON_KEYS = (
+    ("temp", "temperature_c"),
+    ("voltage", "voltage_v"),
+    ("current", "current_ma"),
+    ("tx_power", "tx_power_dbm"),
+    ("rx_power", "rx_power_dbm"),
+)
+
+
+def _decode_json_root(body: str) -> Optional[dict]:
     raw = body.strip()
     if not raw.startswith("{"):
-        return
+        return None
     try:
-        obj = demjson.decode(raw)
-    except Exception:
-        return
-    if not isinstance(obj, dict):
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        pass
+    if demjson is not None:
+        try:
+            obj = demjson.decode(raw)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _fill_from_firmware_gpon_keys(info: dict, out: Dict[str, Optional[float]]) -> None:
+    for js_key, out_key in _FIRMWARE_GPON_KEYS:
+        if js_key not in info:
+            continue
+        v = _coerce_float(info[js_key])
+        if v is not None:
+            out[out_key] = v
+
+
+def _heuristic_walk_fill_missing(obj: dict, out: Dict[str, Optional[float]]) -> None:
+    if not any(out[k] is None for k in out):
         return
 
     candidates: Dict[str, List[Tuple[float, str]]] = {
@@ -175,16 +164,84 @@ def _fill_from_demjson(body: str, out: Dict[str, Optional[float]]) -> None:
                 return val
         return lst[0][0]
 
+    picks = (
+        ("temperature_c", "optic"),
+        ("voltage_v", "optic"),
+        ("current_ma", "optic"),
+        ("tx_power_dbm", "tx"),
+        ("rx_power_dbm", "rx"),
+    )
+    for out_key, prefer in picks:
+        if out[out_key] is None:
+            out[out_key] = pick(candidates[out_key], prefer)
+
+
+def parse_gpon_info_body(body: str) -> Dict[str, Optional[float]]:
+    """
+    Extract optic metrics from raw HTTP body (JSON from CGI, or HTML labels).
+    Returns keys: temperature_c, voltage_v, current_ma, tx_power_dbm, rx_power_dbm.
+    """
+    out: Dict[str, Optional[float]] = {
+        "temperature_c": None,
+        "voltage_v": None,
+        "current_ma": None,
+        "tx_power_dbm": None,
+        "rx_power_dbm": None,
+    }
+
+    root = _decode_json_root(body)
+    if root is not None:
+        _fill_from_firmware_gpon_keys(root, out)
+
     if out["temperature_c"] is None:
-        out["temperature_c"] = pick(candidates["temperature_c"], "optic")
+        t = _parse_float_unit(
+            body,
+            re.compile(r"Temperature\s*:\s*([\d.]+)\s*C", re.I),
+            float,
+        )
+        if t is not None:
+            out["temperature_c"] = t
+
     if out["voltage_v"] is None:
-        out["voltage_v"] = pick(candidates["voltage_v"], "optic")
+        v = _parse_float_unit(
+            body,
+            re.compile(r"Voltage\s*:\s*([\d.]+)\s*V", re.I),
+            float,
+        )
+        if v is not None:
+            out["voltage_v"] = v
+
     if out["current_ma"] is None:
-        out["current_ma"] = pick(candidates["current_ma"], "optic")
+        c = _parse_float_unit(
+            body,
+            re.compile(r"Current\s*:\s*([\d.]+)\s*mA", re.I),
+            float,
+        )
+        if c is not None:
+            out["current_ma"] = c
+
     if out["tx_power_dbm"] is None:
-        out["tx_power_dbm"] = pick(candidates["tx_power_dbm"], "tx")
+        tx = _parse_float_unit(
+            body,
+            re.compile(r"TX\s*Power\s*:\s*([-+]?[\d.]+)\s*dBm", re.I),
+            float,
+        )
+        if tx is not None:
+            out["tx_power_dbm"] = tx
+
     if out["rx_power_dbm"] is None:
-        out["rx_power_dbm"] = pick(candidates["rx_power_dbm"], "rx")
+        rx = _parse_float_unit(
+            body,
+            re.compile(r"Rx\s*Power\s*:?\s*([-+]?[\d.]+)\s*dBm", re.I),
+            float,
+        )
+        if rx is not None:
+            out["rx_power_dbm"] = rx
+
+    if root is not None and any(out[k] is None for k in out):
+        _heuristic_walk_fill_missing(root, out)
+
+    return out
 
 
 def scrape_http(
