@@ -59,40 +59,116 @@ def _coerce_float(val: Any) -> Optional[float]:
 
 
 # Keys from gpon_info.html getGponInfoResult() — raw CGI values before UI adds units.
-_FIRMWARE_GPON_KEYS = (
-    ("temp", "temperature_c"),
-    ("voltage", "voltage_v"),
-    ("current", "current_ma"),
-    ("tx_power", "tx_power_dbm"),
-    ("rx_power", "rx_power_dbm"),
+# Each metric lists accepted JSON keys (first match wins).
+_FIRMWARE_KEY_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("temperature_c", ("temp", "Temp", "TEMP", "temperature", "optic_temp", "opticTemp")),
+    ("voltage_v", ("voltage", "Voltage", "volt", "optic_voltage")),
+    ("current_ma", ("current", "Current", "bias", "bias_current", "optic_current")),
+    ("tx_power_dbm", ("tx_power", "txPower", "TXPower", "txpower", "optic_tx_power")),
+    ("rx_power_dbm", ("rx_power", "rxPower", "RXPower", "rxpower", "optic_rx_power")),
 )
 
 
+def _strip_bom(s: str) -> str:
+    return s.lstrip("\ufeff").strip()
+
+
+def _extract_json_object_string(body: str) -> Optional[str]:
+    """
+    Return a {...} slice: full body if it is JSON, else first balanced {...} block
+    (handles while(1); prefix, JSON embedded in HTML, etc.).
+    """
+    raw = _strip_bom(body)
+    for anti in ("while(1);", "while(true);", ")]}'", ")]},\n"):
+        if raw.startswith(anti):
+            raw = raw[len(anti) :].lstrip()
+    if not raw:
+        return None
+    if raw[0] == "{":
+        start = 0
+    else:
+        start = raw.find("{")
+        if start < 0:
+            return None
+    depth = 0
+    in_str: Optional[str] = None
+    esc = False
+    for i, c in enumerate(raw[start:], start=start):
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == in_str:
+                in_str = None
+            continue
+        if c in "\"'":
+            in_str = c
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[start : i + 1]
+    return None
+
+
+def _as_root_dict(obj: Any) -> Optional[dict]:
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, dict):
+                return item
+    return None
+
+
 def _decode_json_root(body: str) -> Optional[dict]:
-    raw = body.strip()
-    if not raw.startswith("{"):
+    candidate = _extract_json_object_string(body)
+    if not candidate:
         return None
     try:
-        obj = json.loads(raw)
-        return obj if isinstance(obj, dict) else None
+        obj = json.loads(candidate)
+        return _as_root_dict(obj)
     except json.JSONDecodeError:
         pass
     if demjson is not None:
         try:
-            obj = demjson.decode(raw)
-            return obj if isinstance(obj, dict) else None
+            obj = demjson.decode(candidate)
+            return _as_root_dict(obj)
         except Exception:
-            return None
+            pass
     return None
 
 
 def _fill_from_firmware_gpon_keys(info: dict, out: Dict[str, Optional[float]]) -> None:
-    for js_key, out_key in _FIRMWARE_GPON_KEYS:
-        if js_key not in info:
+    # Exact key match first (case-sensitive as in firmware)
+    for out_key, js_keys in _FIRMWARE_KEY_GROUPS:
+        if out[out_key] is not None:
             continue
-        v = _coerce_float(info[js_key])
-        if v is not None:
-            out[out_key] = v
+        for jk in js_keys:
+            if jk not in info:
+                continue
+            v = _coerce_float(info[jk])
+            if v is not None:
+                out[out_key] = v
+                break
+    # Case-insensitive key fallback (some builds use different casing)
+    if any(out[k] is None for k in out):
+        lowered = {str(k).lower(): (k, info[k]) for k in info}
+        for out_key, js_keys in _FIRMWARE_KEY_GROUPS:
+            if out[out_key] is not None:
+                continue
+            for jk in js_keys:
+                lk = jk.lower()
+                if lk not in lowered:
+                    continue
+                _k, val = lowered[lk]
+                v = _coerce_float(val)
+                if v is not None:
+                    out[out_key] = v
+                    break
 
 
 def _heuristic_walk_fill_missing(obj: dict, out: Dict[str, Optional[float]]) -> None:
@@ -176,6 +252,39 @@ def _heuristic_walk_fill_missing(obj: dict, out: Dict[str, Optional[float]]) -> 
             out[out_key] = pick(candidates[out_key], prefer)
 
 
+_WS = r"[\s\u00a0\u2000-\u200b]"  # ASCII ws + NBSP + common Unicode spaces
+
+
+def _inline_json_numbers(body: str, out: Dict[str, Optional[float]]) -> None:
+    """Pull numeric fields from JSON-like fragments embedded in HTML or logs."""
+    patterns = (
+        ("temperature_c", re.compile(r'["\']?temp["\']?\s*:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', re.I)),
+        ("voltage_v", re.compile(r'["\']?voltage["\']?\s*:\s*([-+]?\d*\.?\d+)', re.I)),
+        ("current_ma", re.compile(r'["\']?current["\']?\s*:\s*([-+]?\d*\.?\d+)', re.I)),
+        ("tx_power_dbm", re.compile(r'["\']?tx_power["\']?\s*:\s*([-+]?\d*\.?\d+)', re.I)),
+        ("rx_power_dbm", re.compile(r'["\']?rx_power["\']?\s*:\s*([-+]?\d*\.?\d+)', re.I)),
+    )
+    for key, rx in patterns:
+        if out[key] is not None:
+            continue
+        m = rx.search(body)
+        if m:
+            try:
+                out[key] = float(m.group(1))
+            except ValueError:
+                pass
+
+
+def _nested_gpon_dicts(root: dict) -> List[dict]:
+    """Try root and common wrapper keys used by embedded / CGI JSON."""
+    out: List[dict] = [root]
+    for k in ("data", "gpon", "gpon_info", "result", "info", "optic", "payload", "body"):
+        v = root.get(k)
+        if isinstance(v, dict):
+            out.append(v)
+    return out
+
+
 def parse_gpon_info_body(body: str) -> Dict[str, Optional[float]]:
     """
     Extract optic metrics from raw HTTP body (JSON from CGI, or HTML labels).
@@ -191,12 +300,15 @@ def parse_gpon_info_body(body: str) -> Dict[str, Optional[float]]:
 
     root = _decode_json_root(body)
     if root is not None:
-        _fill_from_firmware_gpon_keys(root, out)
+        for d in _nested_gpon_dicts(root):
+            _fill_from_firmware_gpon_keys(d, out)
+
+    _inline_json_numbers(body, out)
 
     if out["temperature_c"] is None:
         t = _parse_float_unit(
             body,
-            re.compile(r"Temperature\s*:\s*([\d.]+)\s*C", re.I),
+            re.compile(rf"Temperature{_WS}*[:]{_WS}*([\d.]+){_WS}*°?{_WS}*C", re.I),
             float,
         )
         if t is not None:
@@ -205,7 +317,7 @@ def parse_gpon_info_body(body: str) -> Dict[str, Optional[float]]:
     if out["voltage_v"] is None:
         v = _parse_float_unit(
             body,
-            re.compile(r"Voltage\s*:\s*([\d.]+)\s*V", re.I),
+            re.compile(rf"Voltage{_WS}*[:]{_WS}*([\d.]+){_WS}*V", re.I),
             float,
         )
         if v is not None:
@@ -214,7 +326,7 @@ def parse_gpon_info_body(body: str) -> Dict[str, Optional[float]]:
     if out["current_ma"] is None:
         c = _parse_float_unit(
             body,
-            re.compile(r"Current\s*:\s*([\d.]+)\s*mA", re.I),
+            re.compile(rf"Current{_WS}*[:]{_WS}*([\d.]+){_WS}*mA", re.I),
             float,
         )
         if c is not None:
@@ -223,7 +335,7 @@ def parse_gpon_info_body(body: str) -> Dict[str, Optional[float]]:
     if out["tx_power_dbm"] is None:
         tx = _parse_float_unit(
             body,
-            re.compile(r"TX\s*Power\s*:\s*([-+]?[\d.]+)\s*dBm", re.I),
+            re.compile(rf"TX{_WS}*Power{_WS}*[:]{_WS}*([-+]?[\d.]+){_WS}*dBm", re.I),
             float,
         )
         if tx is not None:
@@ -232,7 +344,7 @@ def parse_gpon_info_body(body: str) -> Dict[str, Optional[float]]:
     if out["rx_power_dbm"] is None:
         rx = _parse_float_unit(
             body,
-            re.compile(r"Rx\s*Power\s*:?\s*([-+]?[\d.]+)\s*dBm", re.I),
+            re.compile(rf"Rx{_WS}*Power{_WS}*:?{_WS}*([-+]?[\d.]+){_WS}*dBm", re.I),
             float,
         )
         if rx is not None:
@@ -251,6 +363,7 @@ def scrape_http(
     timeout: float,
     verify_tls: bool,
     extra_cookie: Optional[str],
+    debug_parse: bool,
 ) -> Tuple[Dict[str, Optional[float]], Optional[str]]:
     """
     Returns (metrics_dict, error). metrics values may be None per field.
@@ -262,6 +375,7 @@ def scrape_http(
         "Accept": "*/*",
         "Referer": f"{base}/gpon_info.html",
         "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+        "User-Agent": "Mozilla/5.0 (compatible; zyxel-sfp-exporter/1.0)",
     }
     if extra_cookie:
         headers["Cookie"] = extra_cookie
@@ -277,8 +391,17 @@ def scrape_http(
         return {}, str(e)
     if r.status_code != 200:
         return {}, f"HTTP {r.status_code}"
-    metrics = parse_gpon_info_body(r.text)
+    # Short JSON bodies are often mis-guessed as ISO-8859-1; UTF-8 is correct for this UI.
+    text = r.content.decode("utf-8-sig", errors="replace")
+    metrics = parse_gpon_info_body(text)
     if metrics.get("temperature_c") is None:
+        if debug_parse:
+            ct = r.headers.get("Content-Type", "")
+            prev = repr(text[:500])
+            sys.stderr.write(
+                f"sfp_http_temperature_exporter: parse debug "
+                f"status={r.status_code} content-type={ct!r} body[:500]={prev}\n"
+            )
         return metrics, "temperature not found in response (parse failed)"
     return metrics, None
 
@@ -364,6 +487,11 @@ def main() -> None:
         default=os.environ.get("ZYXEL_HTTP_COOKIE", ""),
         help="Optional raw Cookie header (e.g. user=admin|admin|guest|0|1|0). Empty omits.",
     )
+    p.add_argument(
+        "--debug-parse",
+        action="store_true",
+        help="On parse failure, log Content-Type and first 500 chars of body to stderr.",
+    )
     args = p.parse_args()
 
     host_port = args.listen.rsplit(":", 1)
@@ -382,6 +510,7 @@ def main() -> None:
             args.timeout,
             verify_tls,
             cookie,
+            args.debug_parse,
         )
         return metrics, err, time.monotonic() - t0
 
@@ -400,7 +529,7 @@ def main() -> None:
             with _lock:
                 metrics, err, dt = do_scrape()
                 if err:
-                    sys.stderr.write(f"sfp_temperature_exporter: {err}\n")
+                    sys.stderr.write(f"sfp_http_temperature_exporter: {err}\n")
                 body = render_metrics(metrics, err, dt)
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
