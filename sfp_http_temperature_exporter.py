@@ -4,9 +4,9 @@ Prometheus text exporter for Zyxel GPON SFP optic stats via HTTP.
 
 Uses GET /cgi/get_gpon_info (same as zyxel_gpon_sfp.py / the Web UI).
 
-The gpon_info.html UI uses evalJSON() on the response and keys temp, voltage,
-current, tx_power, rx_power (see getGponInfoResult in firmware). We parse those
-first, then fall back to labeled HTML regex and a loose dict walk.
+The CGI returns a JavaScript object literal (unquoted keys), not strict JSON, e.g.
+{temp:"42.85",voltage:"3.30",...}. The Web UI uses evalJSON() on it. We parse that
+form natively, then JSON/demjson, then labeled HTML regex and a loose dict walk.
 """
 from __future__ import annotations
 
@@ -124,15 +124,48 @@ def _as_root_dict(obj: Any) -> Optional[dict]:
     return None
 
 
+def _parse_firmware_js_object_literal(candidate: str) -> Optional[Dict[str, Any]]:
+    """
+    Zyxel /cgi/get_gpon_info returns a JavaScript object literal, not JSON:
+    {line_status:"5",loid_status:0,temp:"42.85",voltage:"3.30",...}
+    Keys are unquoted; string values use double quotes; some values are bare numbers.
+    """
+    c = candidate.strip()
+    if not (c.startswith("{") and c.endswith("}")):
+        return None
+    inner = c[1:-1]
+    out: Dict[str, Any] = {}
+    # Quoted string OR bare number (optional sign / exponent). No nested objects.
+    pair = re.compile(
+        r'(\w+)\s*:\s*(?:"([^"]*)"|([-+]?\d+\.?\d*(?:[eE][-+]?\d+)?))'
+    )
+    for m in pair.finditer(inner):
+        key = m.group(1)
+        if m.group(2) is not None:
+            out[key] = m.group(2)
+        else:
+            num = m.group(3)
+            try:
+                out[key] = float(num) if "." in num or "e" in num.lower() else int(num)
+            except ValueError:
+                out[key] = num
+    return out if out else None
+
+
 def _decode_json_root(body: str) -> Optional[dict]:
     candidate = _extract_json_object_string(body)
     if not candidate:
         return None
     try:
         obj = json.loads(candidate)
-        return _as_root_dict(obj)
+        d = _as_root_dict(obj)
+        if d is not None:
+            return d
     except json.JSONDecodeError:
         pass
+    loose = _parse_firmware_js_object_literal(candidate)
+    if loose is not None:
+        return loose
     if demjson is not None:
         try:
             obj = demjson.decode(candidate)
